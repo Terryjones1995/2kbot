@@ -2,8 +2,8 @@
 /**
  * Consolidated & Updated Comp Verification Bot - index.js
  * - Default MIN_GAMES bumped to 100
- * - Duplicate-key insert fallback to avoid crashes on concurrent inserts
- * - Full file replacement as requested
+ * - Duplicate-key insert fallback now creates admin pending approvals & DM
+ * - Admin approve flow now reassigns existing conflicting tag before updating
  *
  * Node 18+, discord.js v14, Supabase, OpenAI, Sharp
  */
@@ -646,6 +646,57 @@ async function saveVerificationRecord(record) {
                 await logToGuild(guild, 'Duplicate-key fallback saved', `A new submission for tag **${record.player_tag}** conflicted with an existing record. The submission was saved as **${alt.player_tag}** and flagged for admin review.`);
               }
             } catch (_) {}
+
+            // --- NEW: create pending approval and DM admin for this fallback insertion ---
+            try {
+              const reqId = crypto.randomUUID();
+              const pending = {
+                userId: record.user_id,
+                guildId: record.guild_id,
+                prevTag: conflictRecord ? conflictRecord.player_tag : null,
+                newTag: record.player_tag,
+                newPlatform: record.platform || null,
+                oldImage: conflictRecord ? conflictRecord.image_url : null,
+                newImage: record.image_url || null,
+                otherUserId: conflictRecord ? conflictRecord.user_id : null,
+                otherImage: conflictRecord ? conflictRecord.image_url : null,
+                altSavedTag: alt.player_tag // what was actually saved
+              };
+              pendingApprovals.set(reqId, pending);
+
+              const adminUser = await client.users.fetch(ADMIN_USER_ID).catch(() => null);
+              const adminEmbed = new EmbedBuilder()
+                .setTitle('Duplicate-key fallback saved — admin attention required')
+                .setDescription(`A new submission for tag **${record.player_tag}** conflicted with an existing record. The submission was automatically saved as **${alt.player_tag}** and flagged for admin review.\n\nIf you want to make the newly-saved submission the canonical tag, approve it. Otherwise, deny to keep the existing owner.`)
+                .addFields(
+                  { name: 'Guild', value: `<@${record.guild_id}> (${record.guild_id})`, inline: true },
+                  { name: 'New submitter', value: `<@${record.user_id}>`, inline: true },
+                  { name: 'Existing owner', value: conflictRecord ? `<@${conflictRecord.user_id}>` : 'None found', inline: true }
+                )
+                .setTimestamp();
+
+              const comps = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`admin_approve:${reqId}`).setLabel('Approve new submission').setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId(`admin_deny:${reqId}`).setLabel('Keep existing / Deny new').setStyle(ButtonStyle.Danger)
+              );
+
+              if (adminUser) {
+                try {
+                  await adminUser.send({ embeds: [adminEmbed], components: [comps] }).catch(() => { throw new Error('admin DM send failed'); });
+                  if (pending.oldImage) await adminUser.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
+                  if (pending.newImage) await adminUser.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+                } catch (e) {
+                  // fail gracefully: admin DM failed; log to guild as fallback
+                  if (OCR_DEBUG) console.warn('Failed to DM admin for duplicate-key fallback:', e?.message || e);
+                  try { if (record.guild_id) { const g = await client.guilds.fetch(record.guild_id).catch(() => null); if (g) await logToGuild(g, 'Duplicate-key fallback - admin DM failed', `Could not DM admin for duplicate-key fallback for tag ${record.player_tag}`); } } catch (_) {}
+                }
+              } else {
+                if (OCR_DEBUG) console.warn('Admin user not found for duplicate-key fallback', ADMIN_USER_ID);
+              }
+            } catch (e) {
+              if (OCR_DEBUG) console.warn('Failed creating pending approval for duplicate-key fallback:', e?.message || e);
+            }
+
             return altResp.data;
           } else {
             // if even fallback insert fails, rethrow original error
@@ -682,7 +733,7 @@ async function saveVerificationRecord(record) {
       }
     }
 
-    // handle duplicate-key error code 23505 from Postgres if present
+    // handle duplicate-key error code 23505 from Postgres if present (caught at exception level)
     if (err && (err.code === '23505' || emsg.includes('duplicate key') || emsg.includes('violates unique constraint'))) {
       try {
         const conflictQuery = await supabase.from('comp_verifications')
@@ -710,6 +761,56 @@ async function saveVerificationRecord(record) {
               await logToGuild(guild, 'Duplicate-key fallback saved', `A new submission for tag **${record.player_tag}** conflicted with an existing record. The submission was saved as **${alt.player_tag}** and flagged for admin review.`);
             }
           } catch (_) {}
+
+          // --- NEW: create pending approval and DM admin for this fallback insertion (same as above) ---
+          try {
+            const reqId = crypto.randomUUID();
+            const pending = {
+              userId: record.user_id,
+              guildId: record.guild_id,
+              prevTag: conflictRecord ? conflictRecord.player_tag : null,
+              newTag: record.player_tag,
+              newPlatform: record.platform || null,
+              oldImage: conflictRecord ? conflictRecord.image_url : null,
+              newImage: record.image_url || null,
+              otherUserId: conflictRecord ? conflictRecord.user_id : null,
+              otherImage: conflictRecord ? conflictRecord.image_url : null,
+              altSavedTag: alt.player_tag
+            };
+            pendingApprovals.set(reqId, pending);
+
+            const adminUser = await client.users.fetch(ADMIN_USER_ID).catch(() => null);
+            const adminEmbed = new EmbedBuilder()
+              .setTitle('Duplicate-key fallback saved — admin attention required')
+              .setDescription(`A new submission for tag **${record.player_tag}** conflicted with an existing record. The submission was automatically saved as **${alt.player_tag}** and flagged for admin review.\n\nIf you want to make the newly-saved submission the canonical tag, approve it. Otherwise, deny to keep the existing owner.`)
+              .addFields(
+                { name: 'Guild', value: `<@${record.guild_id}> (${record.guild_id})`, inline: true },
+                { name: 'New submitter', value: `<@${record.user_id}>`, inline: true },
+                { name: 'Existing owner', value: conflictRecord ? `<@${conflictRecord.user_id}>` : 'None found', inline: true }
+              )
+              .setTimestamp();
+
+            const comps = new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId(`admin_approve:${reqId}`).setLabel('Approve new submission').setStyle(ButtonStyle.Success),
+              new ButtonBuilder().setCustomId(`admin_deny:${reqId}`).setLabel('Keep existing / Deny new').setStyle(ButtonStyle.Danger)
+            );
+
+            if (adminUser) {
+              try {
+                await adminUser.send({ embeds: [adminEmbed], components: [comps] }).catch(() => { throw new Error('admin DM send failed'); });
+                if (pending.oldImage) await adminUser.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
+                if (pending.newImage) await adminUser.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+              } catch (e) {
+                if (OCR_DEBUG) console.warn('Failed to DM admin for duplicate-key fallback:', e?.message || e);
+                try { if (record.guild_id) { const g = await client.guilds.fetch(record.guild_id).catch(() => null); if (g) await logToGuild(g, 'Duplicate-key fallback - admin DM failed', `Could not DM admin for duplicate-key fallback for tag ${record.player_tag}`); } } catch (_) {}
+              }
+            } else {
+              if (OCR_DEBUG) console.warn('Admin user not found for duplicate-key fallback', ADMIN_USER_ID);
+            }
+          } catch (e) {
+            if (OCR_DEBUG) console.warn('Failed creating pending approval for duplicate-key fallback:', e?.message || e);
+          }
+
           return altResp.data;
         } else {
           throw err;
@@ -1084,7 +1185,6 @@ async function postOrUpdateVerificationEmbed(channel) {
   }
 }
 
-
 // ================ find guild utility ================
 async function findGuildForUser(userId) {
   const candidates = [];
@@ -1144,7 +1244,43 @@ client.on('interactionCreate', async (interaction) => {
         // Approve
         if (action === 'admin_approve') {
           try {
-            // Update latest DB record with new tag/platform and clear flagged state
+            // --- NEW: if another existing record already has the desired tag, move that record aside first ---
+            if (pending.newTag) {
+              try {
+                const conflictQuery = await supabase.from('comp_verifications')
+                  .select()
+                  .eq('guild_id', pending.guildId)
+                  .eq('player_tag', pending.newTag)
+                  .neq('user_id', pending.userId)
+                  .order('created_at', { ascending: false })
+                  .limit(1);
+
+                const conflicting = (!conflictQuery.error && conflictQuery.data && conflictQuery.data.length > 0) ? conflictQuery.data[0] : null;
+                if (conflicting) {
+                  // rename the existing owner's tag so we can assign it to the new user
+                  const newTagForOld = `${conflicting.player_tag}__reassigned__${crypto.randomUUID().slice(0,8)}`;
+                  await updateLatestRecord(conflicting.user_id, pending.guildId, {
+                    player_tag: newTagForOld,
+                    flagged: true,
+                    flag_reason: `Tag reassigned to <@${pending.userId}> by admin`
+                  }).catch(e => { if (OCR_DEBUG) console.warn('Failed to move aside conflicting record:', e?.message || e); });
+
+                  try {
+                    // notify old owner
+                    const oldUser = await client.users.fetch(conflicting.user_id).catch(() => null);
+                    if (oldUser) {
+                      await oldUser.send(`An admin reassigned your player tag **${conflicting.player_tag}** to another account as part of a dispute resolution. Your saved tag has been renamed to **${newTagForOld}** and flagged for admin review. If this is unexpected, contact an admin.`).catch(() => null);
+                    }
+                    const g = await client.guilds.fetch(pending.guildId).catch(() => null);
+                    if (g) await logToGuild(g, 'Tag reassigned by admin', `Existing owner <@${conflicting.user_id}>'s tag ${conflicting.player_tag} was reassigned to allow assignment to <@${pending.userId}> by admin.`);
+                  } catch (_) {}
+                }
+              } catch (e) {
+                if (OCR_DEBUG) console.warn('Error checking/moving aside pre-existing tag during admin approval:', e?.message || e);
+              }
+            }
+
+            // Update latest DB record with new tag/platform and clear flagged state on pending user
             await updateLatestRecord(pending.userId, pending.guildId, {
               player_tag: pending.newTag,
               platform: pending.newPlatform,
@@ -1676,3 +1812,5 @@ client.on('messageCreate', async (message) => {
 client.login(TOKEN).catch(err => {
   console.error('Failed to login:', err?.message || err);
 });
+
+// end of file
