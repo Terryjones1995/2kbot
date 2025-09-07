@@ -327,7 +327,7 @@ async function findOrCreateChannel(guild) {
     const created = await guild.channels.create({
       name: VERIF_CREATE_NAME,
       type: ChannelType.GuildText,
-      topic: 'Comp verification for NBA2K26. Click Verify to start. Upload screenshots via DM. Comp players get access to comp channels.',
+      topic: 'Comp verification for NBA2K26. Click Verify to start. Upload screenshots via DM. Make sure the **Games Played** number and **Win percentage** are visible.',
       parent: category ? category.id : undefined,
       permissionOverwrites: [
         {
@@ -572,7 +572,10 @@ player_tag is the PSN or Gamertag shown on the screen. platform is PSN, Xbox, or
     points: parsed.points != null ? parseInt(parsed.points, 10) : null,
     rebounds: parsed.rebounds != null ? parseInt(parsed.rebounds, 10) : null,
     assists: parsed.assists != null ? parseInt(parsed.assists, 10) : null,
-    player_tag: parsed.player_tag != null ? String(parsed.player_tag).trim() : null,
+    // IMPORTANT: treat empty or whitespace-only tags as null
+    player_tag: (parsed.player_tag != null && String(parsed.player_tag).trim().length > 0)
+                ? String(parsed.player_tag).trim()
+                : null,
     platform: parsed.platform != null ? String(parsed.platform).trim() : null
   };
 }
@@ -897,8 +900,12 @@ async function findRecordByTag(guild_id, tag) {
 
 // evaluation helpers
 function evaluateStats({ win_pct, games_played }) {
-  const meetsGames = (typeof games_played === 'number') && games_played >= MIN_GAMES;
-  const meetsWin = (typeof win_pct === 'number') && win_pct >= MIN_WIN_PCT;
+  // Coerce into numbers and validate
+  const gp = Number(games_played);
+  const wp = Number(win_pct);
+
+  const meetsGames = Number.isFinite(gp) && gp >= MIN_GAMES;
+  const meetsWin = Number.isFinite(wp) && wp >= MIN_WIN_PCT;
   const passed = meetsGames && meetsWin;
   return { passed, meetsGames, meetsWin };
 }
@@ -1513,6 +1520,13 @@ client.on('messageCreate', async (message) => {
     // parse image (OpenAI)
     const parsed = await parseImageStats(url);
     parsed.image_hash = parsed.image_hash || image_hash;
+
+    // --- Defensive normalization: coerce & validate parsed fields so empty/whitespace tags are treated as missing ---
+    parsed.player_tag = parsed.player_tag ? String(parsed.player_tag).trim() : null;
+    parsed.games_played = (parsed.games_played != null && parsed.games_played !== '') ? Number(parsed.games_played) : null;
+    parsed.win_pct = (parsed.win_pct != null && parsed.win_pct !== '') ? Number(parsed.win_pct) : null;
+    if (!Number.isFinite(parsed.games_played)) parsed.games_played = null;
+    if (!Number.isFinite(parsed.win_pct)) parsed.win_pct = null;
 
     // If we could not parse the essential fields, refuse and do NOT save
     const essentialMissing = (parsed.player_tag == null) || (parsed.games_played == null) || (parsed.win_pct == null);
