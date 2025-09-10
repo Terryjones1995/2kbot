@@ -3,7 +3,7 @@
  * Consolidated & Updated Comp Verification Bot - index.js
  * - Default MIN_GAMES bumped to 100
  * - Duplicate-key insert fallback now creates admin pending approvals & posts to admin approval channel (instead of DM)
- * - Admin approve flow now reassigns existing conflicting tag before updating
+ * - Admin approve flow now reassigns existing conflicting tag before updating (safe update + retry)
  * - Player card / verified announcement default changed to 1410721232755753173 (configurable)
  *
  * Node 18+, discord.js v14, Supabase, OpenAI, Sharp
@@ -100,7 +100,8 @@ const client = new Client({
 let readyRan = false;
 
 // pending approvals store (in-memory)
-const pendingApprovals = new Map(); // reqId -> { userId, guildId, prevTag, newTag, newPlatform, oldImage, newImage, otherUserId, otherImage, altSavedTag }
+// reqId -> { userId, guildId, prevTag, newTag, newPlatform, oldImage, newImage, otherUserId, otherImage, altSavedTag, msgIds: [] }
+const pendingApprovals = new Map();
 
 // ---------- helpers for admin channel persistence ----------
 async function getSavedAdminChannelId(guildId) {
@@ -738,7 +739,8 @@ async function saveVerificationRecord(record) {
                 newImage: record.image_url || null,
                 otherUserId: conflictRecord ? conflictRecord.user_id : null,
                 otherImage: conflictRecord ? conflictRecord.image_url : null,
-                altSavedTag: alt.player_tag // what was actually saved
+                altSavedTag: alt.player_tag, // what was actually saved
+                msgIds: []
               };
               pendingApprovals.set(reqId, pending);
 
@@ -765,12 +767,20 @@ async function saveVerificationRecord(record) {
                 if (guild) {
                   const adminCh = await findOrCreateAdminApprovalChannel(guild).catch(() => null);
                   if (adminCh) {
+                    // send embed and capture message ids so we can delete them later
                     const sent = await adminCh.send({ embeds: [adminEmbed], components: [comps] }).catch(() => null);
                     if (sent) {
                       posted = true;
+                      pending.msgIds.push(sent.id);
                       // send images as followups in channel so they are visible
-                      if (pending.oldImage) await adminCh.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
-                      if (pending.newImage) await adminCh.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+                      if (pending.oldImage) {
+                        const mOld = await adminCh.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
+                        if (mOld) pending.msgIds.push(mOld.id);
+                      }
+                      if (pending.newImage) {
+                        const mNew = await adminCh.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+                        if (mNew) pending.msgIds.push(mNew.id);
+                      }
                     }
                   }
                 }
@@ -876,7 +886,8 @@ async function saveVerificationRecord(record) {
               newImage: record.image_url || null,
               otherUserId: conflictRecord ? conflictRecord.user_id : null,
               otherImage: conflictRecord ? conflictRecord.image_url : null,
-              altSavedTag: alt.player_tag
+              altSavedTag: alt.player_tag,
+              msgIds: []
             };
             pendingApprovals.set(reqId, pending);
 
@@ -904,8 +915,15 @@ async function saveVerificationRecord(record) {
                   const sent = await adminCh.send({ embeds: [adminEmbed], components: [comps] }).catch(() => null);
                   if (sent) {
                     posted = true;
-                    if (pending.oldImage) await adminCh.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
-                    if (pending.newImage) await adminCh.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+                    pending.msgIds.push(sent.id);
+                    if (pending.oldImage) {
+                      const mOld = await adminCh.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
+                      if (mOld) pending.msgIds.push(mOld.id);
+                    }
+                    if (pending.newImage) {
+                      const mNew = await adminCh.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+                      if (mNew) pending.msgIds.push(mNew.id);
+                    }
                   }
                 }
               }
@@ -943,6 +961,52 @@ async function saveVerificationRecord(record) {
 
     // if all else fails, rethrow
     throw err;
+  }
+}
+
+// Safe update helper:
+// Try updateLatestRecord(user_id,guild_id,updates). If update throws a unique-constraint error when setting player_tag,
+// find the conflicting record(s), rename the conflicting record's tag so we can apply the desired tag, then retry once.
+async function safeUpdateLatestRecordWithTag(user_id, guild_id, updates) {
+  try {
+    return await updateLatestRecord(user_id, guild_id, updates);
+  } catch (err) {
+    const emsg = String(err?.message || '').toLowerCase();
+    if (!(err?.code === '23505' || emsg.includes('duplicate key') || emsg.includes('violates unique constraint'))) {
+      throw err;
+    }
+
+    // Only handle if we're actually setting a player_tag
+    const desiredTag = updates.player_tag;
+    if (!desiredTag) throw err;
+
+    // find a conflicting row
+    try {
+      const q = await supabase.from('comp_verifications')
+        .select()
+        .eq('guild_id', guild_id)
+        .eq('player_tag', desiredTag)
+        .neq('user_id', user_id)
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      const conflict = (!q.error && q.data && q.data.length > 0) ? q.data[0] : null;
+      if (!conflict) throw err;
+
+      const newTagForOld = `${conflict.player_tag}__reassigned__${crypto.randomUUID().slice(0,8)}`;
+      await updateLatestRecord(conflict.user_id, guild_id, {
+        player_tag: newTagForOld,
+        flagged: true,
+        flag_reason: `Tag reassigned to <@${user_id}> by admin`
+      }).catch(e => {
+        if (OCR_DEBUG) console.warn('Failed to move aside conflicting record in safeUpdate:', e?.message || e);
+      });
+
+      // retry the update for desired user
+      return await updateLatestRecord(user_id, guild_id, updates);
+    } catch (e) {
+      throw err;
+    }
   }
 }
 
@@ -1233,7 +1297,7 @@ async function onReadyHandler() {
         if (ageDays >= REVERIFY_DAYS) {
           try {
             const user = await client.users.fetch(rec.user_id);
-            await user.send(`Hi — your Comp verification has expired (more than ${REVERIFY_DAYS} days). Please re-verify by clicking the Verify button in the "${CHANNEL_NAME}" channel on the server.`);
+            await user.send(`Hi — your Comp verification has expired (more than ${REVERIFY_DAYS} days). Please re-verify by clicking the Verify button in the "${CHANNEL_NAME}" channel on the server.`).catch(()=>{});
             try {
               const guild = await client.guilds.fetch(rec.guild_id).catch(() => null);
               if (guild) {
@@ -1342,17 +1406,29 @@ client.on('interactionCreate', async (interaction) => {
       // Start verify button
       if (interaction.customId === 'start_verify') {
         // Use flags number 64 for ephemeral
-        await interaction.reply({ content: 'I sent you a DM with verification instructions. Check your DMs.', flags: 64 });
+        try {
+          await interaction.reply({ content: 'I sent you a DM with verification instructions. Check your DMs.', ephemeral: true });
+        } catch (e) {
+          // fallback: still try to DM
+        }
         try {
           const dm = await interaction.user.createDM();
           await dm.send('Please upload a single clear screenshot of your NBA2K Stats screen in this DM. Make sure Games Played and Win percentage are visible. After upload, I will process it and notify you in DM.');
         } catch (err) {
-          await interaction.followUp({ content: 'I could not DM you. Please enable DMs from server members or message the bot directly.', flags: 64 });
+          try { await interaction.followUp({ content: 'I could not DM you. Please enable DMs from server members or message the bot directly.', ephemeral: true }); } catch (_) {}
         }
+        return;
       }
 
       // admin approval buttons (now expected in-server admin-approval channel)
       if (interaction.customId && (interaction.customId.startsWith('admin_approve:') || interaction.customId.startsWith('admin_deny:'))) {
+        // Defer reply ephemerally to acknowledge the interaction promptly.
+        try {
+          await interaction.deferReply({ ephemeral: true });
+        } catch (e) {
+          // ignore defer failure, we'll continue
+        }
+
         // Authorization: allow configured ADMIN_USER_ID OR a guild member with Manage Guild permissions
         let authorized = false;
         try {
@@ -1368,7 +1444,7 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         if (!authorized) {
-          await interaction.reply({ content: 'You are not authorized to perform this action.', flags: 64 });
+          try { await interaction.editReply({ content: 'You are not authorized to perform this action.' }); } catch (_) {}
           return;
         }
 
@@ -1377,68 +1453,35 @@ client.on('interactionCreate', async (interaction) => {
         const reqId = parts[1];
         const pending = pendingApprovals.get(reqId);
         if (!pending) {
-          // maybe already handled
-          try { await interaction.update({ content: 'This approval request is no longer valid or was already handled.', components: [] }); } catch(_) {}
-          try { await interaction.message.delete().catch(() => null); } catch (_) {}
+          try { await interaction.editReply({ content: 'This approval request is no longer valid or was already handled.' }); } catch(_) {}
+          // try to delete the original admin message if present
+          try { if (interaction.message && interaction.message.deletable) await interaction.message.delete().catch(() => null); } catch (_) {}
           return;
         }
 
         // Approve
         if (action === 'admin_approve') {
           try {
-            // --- NEW: if another existing record already has the desired tag, move that record aside first ---
-            if (pending.newTag) {
-              try {
-                const conflictQuery = await supabase.from('comp_verifications')
-                  .select()
-                  .eq('guild_id', pending.guildId)
-                  .eq('player_tag', pending.newTag)
-                  .neq('user_id', pending.userId)
-                  .order('created_at', { ascending: false })
-                  .limit(1);
-
-                const conflicting = (!conflictQuery.error && conflictQuery.data && conflictQuery.data.length > 0) ? conflictQuery.data[0] : null;
-                if (conflicting) {
-                  // rename the existing owner's tag so we can assign it to the new user
-                  const newTagForOld = `${conflicting.player_tag}__reassigned__${crypto.randomUUID().slice(0,8)}`;
-                  await updateLatestRecord(conflicting.user_id, pending.guildId, {
-                    player_tag: newTagForOld,
-                    flagged: true,
-                    flag_reason: `Tag reassigned to <@${pending.userId}> by admin`
-                  }).catch(e => { if (OCR_DEBUG) console.warn('Failed to move aside conflicting record:', e?.message || e); });
-
-                  try {
-                    // notify old owner
-                    const oldUser = await client.users.fetch(conflicting.user_id).catch(() => null);
-                    if (oldUser) {
-                      await oldUser.send(`An admin reassigned your player tag **${conflicting.player_tag}** to another account as part of a dispute resolution. Your saved tag has been renamed to **${newTagForOld}** and flagged for admin review. If this is unexpected, contact an admin.`).catch(() => null);
-                    }
-                    const g = await client.guilds.fetch(pending.guildId).catch(() => null);
-                    if (g) await logToGuild(g, 'Tag reassigned by admin', `Existing owner <@${conflicting.user_id}>'s tag ${conflicting.player_tag} was reassigned to allow assignment to <@${pending.userId}> by admin.`);
-                  } catch (_) {}
-                }
-              } catch (e) {
-                if (OCR_DEBUG) console.warn('Error checking/moving aside pre-existing tag during admin approval:', e?.message || e);
-              }
-            }
-
-            // Update latest DB record with new tag/platform and clear flagged state on pending user
-            await updateLatestRecord(pending.userId, pending.guildId, {
+            // Try to safely update the pending user's latest record to the new tag/platform.
+            // This helper will attempt to move aside a conflicting record first if needed.
+            const updateObj = {
               player_tag: pending.newTag,
               platform: pending.newPlatform,
               flagged: false,
               flag_reason: null,
               image_url: pending.newImage || null
+            };
+
+            await safeUpdateLatestRecordWithTag(pending.userId, pending.guildId, updateObj).catch(e => {
+              if (OCR_DEBUG) console.warn('safeUpdateLatestRecordWithTag error:', e?.message || e);
+              throw e;
             });
 
             // If an existing other user was flagged due to this duplicate, clear their flagged state if admin wants (optional)
             if (pending.otherUserId) {
               try {
-                // clear flagged state for the other user's latest record
-                await updateLatestRecord(pending.otherUserId, pending.guildId, { flagged: false, flag_reason: null });
-              } catch (e) {
-                if (OCR_DEBUG) console.warn('Failed to clear flagged state for other user:', e?.message || e);
-              }
+                await updateLatestRecord(pending.otherUserId, pending.guildId, { flagged: false, flag_reason: null }).catch(e => { if (OCR_DEBUG) console.warn('Failed to clear flagged state for other user:', e?.message || e); });
+              } catch (e) {}
             }
 
             // After DB update, re-fetch latest record and attempt to give role if stats meet thresholds
@@ -1469,23 +1512,23 @@ client.on('interactionCreate', async (interaction) => {
                     const botHighestPos = botMember ? botMember.roles.highest.position : -1;
 
                     if (!member) {
-                      if (u) await u.send('Admin approved your tag change but I could not find you in the guild to add the Comp role. Please rejoin or contact an admin.');
+                      if (u) await u.send('An admin approved your tag change but I could not find you in the guild to add the Comp role. Please rejoin or contact an admin.').catch(()=>{});
                       await logToGuild(guild, 'Admin approval - member not found', `Approved tag change for <@${pending.userId}> but member not present to grant role.`);
                     } else if (!botCanManageRoles) {
-                      if (u) await u.send('Admin approved your tag change. You meet verification thresholds but the bot lacks Manage Roles permission to add your Comp role. Ask an admin to assign it.');
+                      if (u) await u.send('An admin approved your tag change. You meet verification thresholds but the bot lacks Manage Roles permission to add your Comp role. Ask an admin to assign it.').catch(()=>{});
                       await logToGuild(guild, 'Admin approval - missing ManageRoles', `Approved tag change for <@${pending.userId}> but bot lacks ManageRoles.`);
                     } else if (roleObj.position >= botHighestPos) {
-                      if (u) await u.send('Admin approved your tag change. You meet verification thresholds but the bot role is lower than the verification role. Ask an admin to move the bot role above the verification role.');
+                      if (u) await u.send('An admin approved your tag change. You meet verification thresholds but the bot role is lower than the verification role. Ask an admin to move the bot role above the verification role.').catch(()=>{});
                       await logToGuild(guild, 'Admin approval - hierarchy issue', `Approved tag change for <@${pending.userId}> but bot role lower than verification role.`);
                     } else {
                       // add role and update DB verified
-                      await member.roles.add(roleObj.id, 'Admin-approved player tag change + meets verification thresholds');
+                      await member.roles.add(roleObj.id, 'Admin-approved player tag change + meets verification thresholds').catch(()=>{});
                       await updateLatestRecord(pending.userId, pending.guildId, {
                         verified: true,
                         verified_at: new Date().toISOString(),
                         expires_at: new Date(Date.now() + REVERIFY_DAYS * 24 * 60 * 60 * 1000).toISOString()
-                      });
-                      if (u) await u.send(`An admin approved your tag change and you meet the verification thresholds. You have been granted the Comp role.`);
+                      }).catch(()=>{});
+                      if (u) await u.send(`An admin approved your tag change and you meet the verification thresholds. You have been granted the Comp role.`).catch(()=>{});
                       await logToGuild(guild, 'Player tag change approved & role granted', `Admin approved tag change and granted role for <@${pending.userId}>. New tag: ${pending.newTag ?? 'N/A'}.`);
 
                       // Post player card to configured channel
@@ -1497,39 +1540,53 @@ client.on('interactionCreate', async (interaction) => {
                       }
                     }
                   } else {
-                    if (u) await u.send('Admin approved your tag change, but I could not find or create the verification role in the server. Please contact a server admin.');
+                    if (u) await u.send('Admin approved your tag change, but I could not find or create the verification role in the server. Please contact a server admin.').catch(()=>{});
                     if (guild) await logToGuild(guild, 'Admin approval - role missing', `Approved tag change for <@${pending.userId}> but role missing/creation failed.`);
                   }
                 } catch (err) {
-                  if (u) await u.send('Admin approved your tag change, but the bot failed to add your Comp role due to an error. Contact an admin.');
+                  if (u) await u.send('Admin approved your tag change, but the bot failed to add your Comp role due to an error. Contact an admin.').catch(()=>{});
                   if (guild) await logToGuild(guild, 'Admin approval - role assign error', `Error assigning role to <@${pending.userId}>: ${err?.message || err}`);
                 }
               } else {
                 // profile updated but stats do not meet threshold
-                if (u) await u.send(`An admin approved your player tag change. Your profile was updated (new tag: ${pending.newTag ?? 'N/A'}), but your saved stats do not meet the verification thresholds (Win%: ${latest.win_pct ?? 'N/A'}, Games: ${latest.games_played ?? 'N/A'}). No Comp role was assigned.`);
+                if (u) await u.send(`An admin approved your player tag change. Your profile was updated (new tag: ${pending.newTag ?? 'N/A'}), but your saved stats do not meet the verification thresholds (Win%: ${latest.win_pct ?? 'N/A'}, Games: ${latest.games_played ?? 'N/A'}). No Comp role was assigned.`).catch(()=>{});
                 if (guild) await logToGuild(guild, 'Player tag change approved - no role (stats low)', `Admin approved tag change for <@${pending.userId}> but stats do not meet thresholds. New tag: ${pending.newTag ?? 'N/A'}.`);
               }
             } else {
               // still notify user/admin
-              if (u) await u.send(`An admin approved your tag change. Your player card was updated, but I couldn't finalize role assignment automatically.`);
+              if (u) await u.send(`An admin approved your tag change. Your player card was updated, but I couldn't finalize role assignment automatically.`).catch(()=>{});
               if (guild) await logToGuild(guild, 'Player tag change approved - post-update check failed', `Approved tag change for <@${pending.userId}> but post-update checks failed.`);
             }
 
-            // update the interaction (reply) then delete the message so channel stays clear
+            // reply to admin (ephemeral)
             try {
-              await interaction.update({ content: 'Approved — user has been updated.', components: [] });
+              await interaction.editReply({ content: 'Approved — user has been updated.' });
             } catch (e) {
-              try { await interaction.reply({ content: 'Approved — user has been updated.', flags: 64 }); } catch(_) {}
+              try { await interaction.followUp({ content: 'Approved — user has been updated.', ephemeral: true }); } catch(_) {}
             }
           } catch (e) {
             console.warn('admin approval error:', e?.message || e);
             try {
-              await interaction.update({ content: 'Failed to apply approval. Check logs.', components: [] });
+              await interaction.editReply({ content: 'Failed to apply approval. Check logs.' });
             } catch (_) {}
           } finally {
+            // cleanup: delete pending messages (admin embed + followups) if posted in admin channel
+            try {
+              if (pending.msgIds && pending.msgIds.length && interaction.channel && interaction.channel.type === ChannelType.GuildText) {
+                for (const mid of pending.msgIds) {
+                  try {
+                    const m = await interaction.channel.messages.fetch(mid).catch(() => null);
+                    if (m && m.deletable) await m.delete().catch(() => null);
+                  } catch (e) {}
+                }
+              }
+              // also remove the original message that triggered the interaction if possible
+              try { if (interaction.message && interaction.message.deletable) await interaction.message.delete().catch(() => null); } catch (_) {}
+            } catch (e) {
+              if (OCR_DEBUG) console.warn('Failed cleanup of admin pending messages after approve:', e?.message || e);
+            }
+
             pendingApprovals.delete(reqId);
-            // attempt to delete the approval message to keep channel clean
-            try { if (interaction.message && interaction.message.deletable) await interaction.message.delete().catch(() => null); } catch (_) {}
           }
         } else {
           // Deny
@@ -1539,20 +1596,35 @@ client.on('interactionCreate', async (interaction) => {
               flag_reason: 'Denied by admin'
             });
             const u = await client.users.fetch(pending.userId).catch(() => null);
-            if (u) await u.send(`An admin denied your requested player tag change. If you believe this is a mistake, contact an admin.`);
+            if (u) await u.send(`An admin denied your requested player tag change. If you believe this is a mistake, contact an admin.`).catch(()=>{});
             const g = await client.guilds.fetch(pending.guildId).catch(() => null);
             if (g) await logToGuild(g, 'Player tag change denied', `Admin denied tag change for <@${pending.userId}>. Prev: ${pending.prevTag}, New: ${pending.newTag}.`);
+
             try {
-              await interaction.update({ content: 'Denied — user has been notified.', components: [] });
+              await interaction.editReply({ content: 'Denied — user has been notified.' });
             } catch (e) {
-              await interaction.reply({ content: 'Denied — user has been notified.', flags: 64 });
+              try { await interaction.followUp({ content: 'Denied — user has been notified.', ephemeral: true }); } catch(_) {}
             }
           } catch (e) {
             console.warn('admin deny error:', e?.message || e);
-            try { await interaction.update({ content: 'Failed to apply denial. Check logs.', components: [] }); } catch(_) {}
+            try { await interaction.editReply({ content: 'Failed to apply denial. Check logs.' }); } catch(_) {}
           } finally {
+            // cleanup admin messages created for this pending
+            try {
+              if (pending.msgIds && pending.msgIds.length && interaction.channel && interaction.channel.type === ChannelType.GuildText) {
+                for (const mid of pending.msgIds) {
+                  try {
+                    const m = await interaction.channel.messages.fetch(mid).catch(() => null);
+                    if (m && m.deletable) await m.delete().catch(() => null);
+                  } catch (e) {}
+                }
+              }
+              try { if (interaction.message && interaction.message.deletable) await interaction.message.delete().catch(() => null); } catch (_) {}
+            } catch (e) {
+              if (OCR_DEBUG) console.warn('Failed cleanup of admin pending messages after deny:', e?.message || e);
+            }
+
             pendingApprovals.delete(reqId);
-            try { if (interaction.message && interaction.message.deletable) await interaction.message.delete().catch(() => null); } catch (_) {}
           }
         }
       }
@@ -1760,7 +1832,8 @@ client.on('messageCreate', async (message) => {
         oldImage: conflictRecord.image_url || null,
         newImage: url,
         otherUserId: conflictRecord.user_id,
-        otherImage: conflictRecord.image_url || null
+        otherImage: conflictRecord.image_url || null,
+        msgIds: []
       };
       pendingApprovals.set(reqId, pending);
 
@@ -1787,8 +1860,15 @@ client.on('messageCreate', async (message) => {
           const sent = await adminCh.send({ embeds: [adminEmbed], components: [comps] }).catch(() => null);
           if (sent) {
             posted = true;
-            if (pending.oldImage) await adminCh.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
-            if (pending.newImage) await adminCh.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+            pending.msgIds.push(sent.id);
+            if (pending.oldImage) {
+              const mOld = await adminCh.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
+              if (mOld) pending.msgIds.push(mOld.id);
+            }
+            if (pending.newImage) {
+              const mNew = await adminCh.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+              if (mNew) pending.msgIds.push(mNew.id);
+            }
             await message.author.send('Your submission was saved but flagged because that player tag already exists. An admin will review this and notify both parties.');
             await client.users.send(conflictRecord.user_id, `Your player tag (${parsed.player_tag}) was used in a new submission and has been flagged. An admin will review the two screenshots.`).catch(() => null);
             await logToGuild(guild, 'Duplicate tag flagged', `User <@${message.author.id}> submitted tag ${parsed.player_tag} which conflicts with <@${conflictRecord.user_id}>.`);
@@ -2000,9 +2080,9 @@ client.on('messageCreate', async (message) => {
   } catch (err) {
     console.error('Error processing DM verification:', err?.message || err);
     if (OCR_DEBUG) {
-      await message.author.send(`Error while parsing your screenshot: ${err?.message || err}. Check bot logs for details.`);
+      try { await message.author.send(`Error while parsing your screenshot: ${err?.message || err}. Check bot logs for details.`).catch(()=>{}); } catch(_) {}
     } else {
-      await message.author.send('Unexpected error while processing your image. Try again later or contact an admin.');
+      try { await message.author.send('Unexpected error while processing your image. Try again later or contact an admin.').catch(()=>{}); } catch(_) {}
     }
   }
 });
