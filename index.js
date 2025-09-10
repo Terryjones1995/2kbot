@@ -2,8 +2,9 @@
 /**
  * Consolidated & Updated Comp Verification Bot - index.js
  * - Default MIN_GAMES bumped to 100
- * - Duplicate-key insert fallback now creates admin pending approvals & DM
+ * - Duplicate-key insert fallback now creates admin pending approvals & posts to admin approval channel (instead of DM)
  * - Admin approve flow now reassigns existing conflicting tag before updating
+ * - Player card / verified announcement default changed to 1410721232755753173 (configurable)
  *
  * Node 18+, discord.js v14, Supabase, OpenAI, Sharp
  */
@@ -50,12 +51,13 @@ const PREFERRED_OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5-mini';
 const OCR_DEBUG = (process.env.OCR_DEBUG || 'false').toLowerCase() === 'true';
 
 // Channel to post player cards (hardcoded fallback updated per your request)
-const PLAYER_CARD_CHANNEL_ID = process.env.PLAYER_CARD_CHANNEL_ID || '1414103417453805681';
+// Keep configurable via env var PLAYER_CARD_CHANNEL_ID
+const PLAYER_CARD_CHANNEL_ID = process.env.PLAYER_CARD_CHANNEL_ID || '1410721232755753173';
 
 // fallback role id (production role you provided). Can still be overridden with env var FALLBACK_ROLE_ID
 const FALLBACK_ROLE_ID = process.env.FALLBACK_ROLE_ID || '1414033567067144202';
 
-// Admin user to receive approvals (provided fallback ID)
+// Admin user fallback (used only if admin approval channel can't be found)
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID || '637758147330572349';
 
 const VERIF_CHANNEL_EMOJI = process.env.VERIF_CHANNEL_EMOJI || '✅';
@@ -98,8 +100,27 @@ const client = new Client({
 let readyRan = false;
 
 // pending approvals store (in-memory)
-const pendingApprovals = new Map(); // reqId -> { userId, guildId, prevTag, newTag, newPlatform, oldImage, newImage, otherUserId, otherImage }
+const pendingApprovals = new Map(); // reqId -> { userId, guildId, prevTag, newTag, newPlatform, oldImage, newImage, otherUserId, otherImage, altSavedTag }
 
+// ---------- helpers for admin channel persistence ----------
+async function getSavedAdminChannelId(guildId) {
+  try {
+    const { data, error } = await supabase.from('comp_settings').select('admin_channel_id').eq('guild_id', guildId).maybeSingle();
+    if (!error && data?.admin_channel_id) return data.admin_channel_id;
+  } catch (err) {
+    if (OCR_DEBUG) console.warn('getSavedAdminChannelId error:', err.message);
+  }
+  return null;
+}
+async function saveAdminChannelId(guildId, channelId) {
+  try {
+    await supabase.from('comp_settings').upsert({ guild_id: guildId, admin_channel_id: channelId }, { onConflict: ['guild_id'] });
+  } catch (err) {
+    console.warn('Failed to persist admin_channel_id to comp_settings:', err?.message || err);
+  }
+}
+
+// common helpers
 function makeChannelCreationName(emoji, baseName) {
   const sanitized = String(baseName).trim().replace(/\s+/g, '-').toLowerCase();
   return `${emoji}-${sanitized}`.slice(0, 100);
@@ -161,7 +182,7 @@ async function registerCommands() {
   }
 }
 
-// supabase small helpers
+// supabase small helpers (existing + added admin channel)
 async function getSavedChannelId(guildId) {
   try {
     const { data, error } = await supabase.from('comp_settings').select('channel_id').eq('guild_id', guildId).maybeSingle();
@@ -183,7 +204,7 @@ async function getSavedLogChannelId(guildId) {
     const { data, error } = await supabase.from('comp_settings').select('log_channel_id').eq('guild_id', guildId).maybeSingle();
     if (!error && data?.log_channel_id) return data.log_channel_id;
   } catch (err) {
-    if (OCR_DEBUG) console.warn('getSavedLogChannelId error:', err.message);
+    if (OCR_DEBUG) console.warn('getSavedLogChannelId error:', err?.message || err);
   }
   return null;
 }
@@ -199,7 +220,7 @@ async function getSavedCategoryId(guildId) {
     const { data, error } = await supabase.from('comp_settings').select('category_id').eq('guild_id', guildId).maybeSingle();
     if (!error && data?.category_id) return data.category_id;
   } catch (err) {
-    if (OCR_DEBUG) console.warn('getSavedCategoryId error:', err.message);
+    if (OCR_DEBUG) console.warn('getSavedCategoryId error:', err?.message || err);
   }
   return null;
 }
@@ -211,7 +232,7 @@ async function saveCategoryId(guildId, categoryId) {
   }
 }
 
-// channel/category helpers (same as before, uses parent category when creating)
+// find/create category/channel helpers
 async function fetchPinsSafe(channel) {
   try {
     if (typeof channel.messages.fetchPins === 'function') {
@@ -407,6 +428,60 @@ async function findOrCreateLogChannel(guild) {
   }
 }
 
+// new: find or create admin approval channel
+async function findOrCreateAdminApprovalChannel(guild) {
+  try {
+    const saved = await getSavedAdminChannelId(guild.id);
+    if (saved) {
+      const ch = await guild.channels.fetch(saved).catch(() => null);
+      if (ch && ch.type === ChannelType.GuildText) return ch;
+      else await saveAdminChannelId(guild.id, null);
+    }
+  } catch (err) { if (OCR_DEBUG) console.warn('Saved admin channel check failed:', err?.message || err); }
+
+  let allChannels;
+  try { allChannels = await guild.channels.fetch(); } catch (err) { allChannels = guild.channels.cache; }
+
+  // look for existing admin-approval channel in guild
+  const matches = allChannels.filter(ch => {
+    if (!ch || ch.type !== ChannelType.GuildText) return false;
+    const name = (ch.name || '').toLowerCase();
+    if (name.includes('admin') && name.includes('approv')) return true;
+    if (fuzzyNameMatch(name, 'admin-approval')) return true;
+    return false;
+  });
+
+  if (matches.size > 0) {
+    const keep = matches.first();
+    await saveAdminChannelId(guild.id, keep.id);
+    return keep;
+  }
+
+  // create under the comp category (if available)
+  const category = await findOrCreateCategory(guild).catch(() => null);
+  try {
+    const created = await guild.channels.create({
+      name: 'admin-approval',
+      type: ChannelType.GuildText,
+      topic: 'Admin approval queue for Comp verification conflicts (approve/deny submissions here). Messages removed after handling.',
+      parent: category ? category.id : undefined,
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          deny: [PermissionsBitField.Flags.SendMessages]
+        }
+      ],
+      reason: 'Create admin approval channel for comp verification'
+    });
+    await saveAdminChannelId(guild.id, created.id);
+    console.log('Created admin approval channel', created.name, 'in guild', guild.id);
+    return created;
+  } catch (err) {
+    if (OCR_DEBUG) console.warn('Could not create admin approval channel (maybe missing perms):', err?.message || err);
+    return null;
+  }
+}
+
 async function logToGuild(guild, title, description) {
   try {
     if (!guild) return;
@@ -467,7 +542,7 @@ async function preprocessForOCR(buffer) {
   return { cleaned, binary };
 }
 
-// OpenAI probing + parsing (unchanged except extended prompt for tag/platform)
+// OpenAI probing + parsing
 async function probeOpenAIModel(modelName) {
   if (!openai) return false;
   try {
@@ -650,7 +725,7 @@ async function saveVerificationRecord(record) {
               }
             } catch (_) {}
 
-            // --- NEW: create pending approval and DM admin for this fallback insertion ---
+            // --- NEW: create pending approval and post to admin approval channel (fallback to DM) ---
             try {
               const reqId = crypto.randomUUID();
               const pending = {
@@ -667,7 +742,7 @@ async function saveVerificationRecord(record) {
               };
               pendingApprovals.set(reqId, pending);
 
-              const adminUser = await client.users.fetch(ADMIN_USER_ID).catch(() => null);
+              // build embed + components
               const adminEmbed = new EmbedBuilder()
                 .setTitle('Duplicate-key fallback saved — admin attention required')
                 .setDescription(`A new submission for tag **${record.player_tag}** conflicted with an existing record. The submission was automatically saved as **${alt.player_tag}** and flagged for admin review.\n\nIf you want to make the newly-saved submission the canonical tag, approve it. Otherwise, deny to keep the existing owner.`)
@@ -683,18 +758,41 @@ async function saveVerificationRecord(record) {
                 new ButtonBuilder().setCustomId(`admin_deny:${reqId}`).setLabel('Keep existing / Deny new').setStyle(ButtonStyle.Danger)
               );
 
-              if (adminUser) {
+              // Try posting to admin approval channel first
+              let posted = false;
+              try {
+                const guild = await client.guilds.fetch(record.guild_id).catch(() => null);
+                if (guild) {
+                  const adminCh = await findOrCreateAdminApprovalChannel(guild).catch(() => null);
+                  if (adminCh) {
+                    const sent = await adminCh.send({ embeds: [adminEmbed], components: [comps] }).catch(() => null);
+                    if (sent) {
+                      posted = true;
+                      // send images as followups in channel so they are visible
+                      if (pending.oldImage) await adminCh.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
+                      if (pending.newImage) await adminCh.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+                    }
+                  }
+                }
+              } catch (e) {
+                if (OCR_DEBUG) console.warn('Admin approval channel post failed:', e?.message || e);
+              }
+
+              if (!posted) {
+                // Fallback to DM the configured ADMIN_USER_ID
                 try {
-                  await adminUser.send({ embeds: [adminEmbed], components: [comps] }).catch(() => { throw new Error('admin DM send failed'); });
-                  if (pending.oldImage) await adminUser.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
-                  if (pending.newImage) await adminUser.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+                  const adminUser = await client.users.fetch(ADMIN_USER_ID).catch(() => null);
+                  if (adminUser) {
+                    await adminUser.send({ embeds: [adminEmbed], components: [comps] }).catch(() => { throw new Error('admin DM send failed'); });
+                    if (pending.oldImage) await adminUser.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
+                    if (pending.newImage) await adminUser.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+                  } else {
+                    if (OCR_DEBUG) console.warn('Admin user not found for duplicate-key fallback', ADMIN_USER_ID);
+                  }
                 } catch (e) {
-                  // fail gracefully: admin DM failed; log to guild as fallback
                   if (OCR_DEBUG) console.warn('Failed to DM admin for duplicate-key fallback:', e?.message || e);
                   try { if (record.guild_id) { const g = await client.guilds.fetch(record.guild_id).catch(() => null); if (g) await logToGuild(g, 'Duplicate-key fallback - admin DM failed', `Could not DM admin for duplicate-key fallback for tag ${record.player_tag}`); } } catch (_) {}
                 }
-              } else {
-                if (OCR_DEBUG) console.warn('Admin user not found for duplicate-key fallback', ADMIN_USER_ID);
               }
             } catch (e) {
               if (OCR_DEBUG) console.warn('Failed creating pending approval for duplicate-key fallback:', e?.message || e);
@@ -765,7 +863,7 @@ async function saveVerificationRecord(record) {
             }
           } catch (_) {}
 
-          // --- NEW: create pending approval and DM admin for this fallback insertion (same as above) ---
+          // --- NEW: create pending approval and post to admin approval channel (same as above) ---
           try {
             const reqId = crypto.randomUUID();
             const pending = {
@@ -782,7 +880,6 @@ async function saveVerificationRecord(record) {
             };
             pendingApprovals.set(reqId, pending);
 
-            const adminUser = await client.users.fetch(ADMIN_USER_ID).catch(() => null);
             const adminEmbed = new EmbedBuilder()
               .setTitle('Duplicate-key fallback saved — admin attention required')
               .setDescription(`A new submission for tag **${record.player_tag}** conflicted with an existing record. The submission was automatically saved as **${alt.player_tag}** and flagged for admin review.\n\nIf you want to make the newly-saved submission the canonical tag, approve it. Otherwise, deny to keep the existing owner.`)
@@ -798,17 +895,38 @@ async function saveVerificationRecord(record) {
               new ButtonBuilder().setCustomId(`admin_deny:${reqId}`).setLabel('Keep existing / Deny new').setStyle(ButtonStyle.Danger)
             );
 
-            if (adminUser) {
+            let posted = false;
+            try {
+              const guild = await client.guilds.fetch(record.guild_id).catch(() => null);
+              if (guild) {
+                const adminCh = await findOrCreateAdminApprovalChannel(guild).catch(() => null);
+                if (adminCh) {
+                  const sent = await adminCh.send({ embeds: [adminEmbed], components: [comps] }).catch(() => null);
+                  if (sent) {
+                    posted = true;
+                    if (pending.oldImage) await adminCh.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
+                    if (pending.newImage) await adminCh.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+                  }
+                }
+              }
+            } catch (e) {
+              if (OCR_DEBUG) console.warn('Admin approval channel post failed:', e?.message || e);
+            }
+
+            if (!posted) {
               try {
-                await adminUser.send({ embeds: [adminEmbed], components: [comps] }).catch(() => { throw new Error('admin DM send failed'); });
-                if (pending.oldImage) await adminUser.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
-                if (pending.newImage) await adminUser.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+                const adminUser = await client.users.fetch(ADMIN_USER_ID).catch(() => null);
+                if (adminUser) {
+                  await adminUser.send({ embeds: [adminEmbed], components: [comps] }).catch(() => { throw new Error('admin DM send failed'); });
+                  if (pending.oldImage) await adminUser.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
+                  if (pending.newImage) await adminUser.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+                } else {
+                  if (OCR_DEBUG) console.warn('Admin user not found for duplicate-key fallback', ADMIN_USER_ID);
+                }
               } catch (e) {
                 if (OCR_DEBUG) console.warn('Failed to DM admin for duplicate-key fallback:', e?.message || e);
                 try { if (record.guild_id) { const g = await client.guilds.fetch(record.guild_id).catch(() => null); if (g) await logToGuild(g, 'Duplicate-key fallback - admin DM failed', `Could not DM admin for duplicate-key fallback for tag ${record.player_tag}`); } } catch (_) {}
               }
-            } else {
-              if (OCR_DEBUG) console.warn('Admin user not found for duplicate-key fallback', ADMIN_USER_ID);
             }
           } catch (e) {
             if (OCR_DEBUG) console.warn('Failed creating pending approval for duplicate-key fallback:', e?.message || e);
@@ -1085,6 +1203,7 @@ async function onReadyHandler() {
       if (ch) await postOrUpdateVerificationEmbed(ch);
       await ensureRoleForGuild(testGuild);
       await findOrCreateLogChannel(testGuild).catch(() => null);
+      await findOrCreateAdminApprovalChannel(testGuild).catch(() => null);
     }
     if (prodGuild && prodGuild.id !== testGuild?.id) {
       await ensureCompSettingsRow(prodGuild.id);
@@ -1093,6 +1212,7 @@ async function onReadyHandler() {
       if (ch) await postOrUpdateVerificationEmbed(ch);
       await ensureRoleForGuild(prodGuild);
       await findOrCreateLogChannel(prodGuild).catch(() => null);
+      await findOrCreateAdminApprovalChannel(prodGuild).catch(() => null);
     }
   } catch (err) {
     console.warn('Error ensuring channels/roles:', err?.message || err);
@@ -1231,10 +1351,23 @@ client.on('interactionCreate', async (interaction) => {
         }
       }
 
-      // admin approval buttons
+      // admin approval buttons (now expected in-server admin-approval channel)
       if (interaction.customId && (interaction.customId.startsWith('admin_approve:') || interaction.customId.startsWith('admin_deny:'))) {
-        // only admin may click
-        if (String(interaction.user.id) !== String(ADMIN_USER_ID)) {
+        // Authorization: allow configured ADMIN_USER_ID OR a guild member with Manage Guild permissions
+        let authorized = false;
+        try {
+          if (interaction.user.id === String(ADMIN_USER_ID)) authorized = true;
+          // if interaction happens in a guild channel, check member permissions
+          if (interaction.member && typeof interaction.member.permissions?.has === 'function') {
+            if (interaction.member.permissions.has(PermissionsBitField.Flags.ManageGuild) || interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+              authorized = true;
+            }
+          }
+        } catch (e) {
+          if (OCR_DEBUG) console.warn('Auth check error for admin approval interaction:', e?.message || e);
+        }
+
+        if (!authorized) {
           await interaction.reply({ content: 'You are not authorized to perform this action.', flags: 64 });
           return;
         }
@@ -1244,7 +1377,9 @@ client.on('interactionCreate', async (interaction) => {
         const reqId = parts[1];
         const pending = pendingApprovals.get(reqId);
         if (!pending) {
-          await interaction.reply({ content: 'This approval request is no longer valid or was already handled.', flags: 64 });
+          // maybe already handled
+          try { await interaction.update({ content: 'This approval request is no longer valid or was already handled.', components: [] }); } catch(_) {}
+          try { await interaction.message.delete().catch(() => null); } catch (_) {}
           return;
         }
 
@@ -1380,12 +1515,21 @@ client.on('interactionCreate', async (interaction) => {
               if (guild) await logToGuild(guild, 'Player tag change approved - post-update check failed', `Approved tag change for <@${pending.userId}> but post-update checks failed.`);
             }
 
-            await interaction.update({ content: 'Approved — user has been updated.', components: [] });
+            // update the interaction (reply) then delete the message so channel stays clear
+            try {
+              await interaction.update({ content: 'Approved — user has been updated.', components: [] });
+            } catch (e) {
+              try { await interaction.reply({ content: 'Approved — user has been updated.', flags: 64 }); } catch(_) {}
+            }
           } catch (e) {
             console.warn('admin approval error:', e?.message || e);
-            await interaction.update({ content: 'Failed to apply approval. Check logs.', components: [] });
+            try {
+              await interaction.update({ content: 'Failed to apply approval. Check logs.', components: [] });
+            } catch (_) {}
           } finally {
             pendingApprovals.delete(reqId);
+            // attempt to delete the approval message to keep channel clean
+            try { if (interaction.message && interaction.message.deletable) await interaction.message.delete().catch(() => null); } catch (_) {}
           }
         } else {
           // Deny
@@ -1398,12 +1542,17 @@ client.on('interactionCreate', async (interaction) => {
             if (u) await u.send(`An admin denied your requested player tag change. If you believe this is a mistake, contact an admin.`);
             const g = await client.guilds.fetch(pending.guildId).catch(() => null);
             if (g) await logToGuild(g, 'Player tag change denied', `Admin denied tag change for <@${pending.userId}>. Prev: ${pending.prevTag}, New: ${pending.newTag}.`);
-            await interaction.update({ content: 'Denied — user has been notified.', components: [] });
+            try {
+              await interaction.update({ content: 'Denied — user has been notified.', components: [] });
+            } catch (e) {
+              await interaction.reply({ content: 'Denied — user has been notified.', flags: 64 });
+            }
           } catch (e) {
             console.warn('admin deny error:', e?.message || e);
-            await interaction.update({ content: 'Failed to apply denial. Check logs.', components: [] });
+            try { await interaction.update({ content: 'Failed to apply denial. Check logs.', components: [] }); } catch(_) {}
           } finally {
             pendingApprovals.delete(reqId);
+            try { if (interaction.message && interaction.message.deletable) await interaction.message.delete().catch(() => null); } catch (_) {}
           }
         }
       }
@@ -1518,7 +1667,20 @@ client.on('messageCreate', async (message) => {
     }
 
     // parse image (OpenAI)
-    const parsed = await parseImageStats(url);
+    let parsed;
+    try {
+      parsed = await parseImageStats(url);
+    } catch (openaiErr) {
+      // detect rate limit or service errors and inform user clearly
+      if (String(openaiErr?.message || '').toLowerCase().includes('rate')) {
+        await message.author.send('Image parsing failed due to a rate limit on the OCR service. Please wait a minute and try again. If this persists, contact an admin.');
+        await logToGuild(guild, 'OpenAI rate limit', `OpenAI parse rate-limited for user <@${message.author.id}>. Error: ${String(openaiErr?.message || openaiErr)}`);
+        return;
+      }
+      // generic fallback
+      throw openaiErr;
+    }
+
     parsed.image_hash = parsed.image_hash || image_hash;
 
     // --- Defensive normalization: coerce & validate parsed fields so empty/whitespace tags are treated as missing ---
@@ -1587,7 +1749,7 @@ client.on('messageCreate', async (message) => {
         if (OCR_DEBUG) console.warn('Failed to flag existing conflicting record:', e?.message || e);
       }
 
-      // Build admin DM showing both screenshots
+      // Build admin embed showing both screenshots
       const reqId = crypto.randomUUID();
       const pending = {
         userId: message.author.id,
@@ -1602,7 +1764,6 @@ client.on('messageCreate', async (message) => {
       };
       pendingApprovals.set(reqId, pending);
 
-      const adminUser = await client.users.fetch(ADMIN_USER_ID).catch(() => null);
       const adminEmbed = new EmbedBuilder()
         .setTitle('Duplicate player tag detected')
         .setDescription(`A new submission uses a player tag that already exists in the system.\n\nTag: **${parsed.player_tag}**\nNew submitter: <@${message.author.id}>\nExisting owner: <@${conflictRecord.user_id}>\n\nPlease review the two screenshots below and decide which submission to accept.`)
@@ -1618,23 +1779,46 @@ client.on('messageCreate', async (message) => {
         new ButtonBuilder().setCustomId(`admin_deny:${reqId}`).setLabel('Keep existing / Deny new').setStyle(ButtonStyle.Danger)
       );
 
-      if (adminUser) {
+      // Try posting to admin approval channel first
+      let posted = false;
+      try {
+        const adminCh = await findOrCreateAdminApprovalChannel(guild).catch(() => null);
+        if (adminCh) {
+          const sent = await adminCh.send({ embeds: [adminEmbed], components: [comps] }).catch(() => null);
+          if (sent) {
+            posted = true;
+            if (pending.oldImage) await adminCh.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
+            if (pending.newImage) await adminCh.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+            await message.author.send('Your submission was saved but flagged because that player tag already exists. An admin will review this and notify both parties.');
+            await client.users.send(conflictRecord.user_id, `Your player tag (${parsed.player_tag}) was used in a new submission and has been flagged. An admin will review the two screenshots.`).catch(() => null);
+            await logToGuild(guild, 'Duplicate tag flagged', `User <@${message.author.id}> submitted tag ${parsed.player_tag} which conflicts with <@${conflictRecord.user_id}>.`);
+          }
+        }
+      } catch (e) {
+        if (OCR_DEBUG) console.warn('Admin approval channel post failed:', e?.message || e);
+      }
+
+      if (!posted) {
+        // fallback to DM the configured admin user
         try {
-          await adminUser.send({ embeds: [adminEmbed], components: [comps] });
-          if (pending.oldImage) await adminUser.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` });
-          if (pending.newImage) await adminUser.send({ content: `New submitter image: ${pending.newImage}` });
-          await message.author.send('Your submission was saved but flagged because that player tag already exists. An admin will review this and notify both parties.');
-          await client.users.send(conflictRecord.user_id, `Your player tag (${parsed.player_tag}) was used in a new submission and has been flagged. An admin will review the two screenshots.`).catch(() => null);
-          await logToGuild(guild, 'Duplicate tag flagged', `User <@${message.author.id}> submitted tag ${parsed.player_tag} which conflicts with <@${conflictRecord.user_id}>.`);
+          const adminUser = await client.users.fetch(ADMIN_USER_ID).catch(() => null);
+          if (adminUser) {
+            await adminUser.send({ embeds: [adminEmbed], components: [comps] });
+            if (pending.oldImage) await adminUser.send({ content: `Existing owner image for <@${conflictRecord.user_id}>: ${pending.oldImage}` }).catch(() => null);
+            if (pending.newImage) await adminUser.send({ content: `New submitter image: ${pending.newImage}` }).catch(() => null);
+            await message.author.send('Your submission was saved but flagged because that player tag already exists. An admin will review this and notify both parties.');
+            await client.users.send(conflictRecord.user_id, `Your player tag (${parsed.player_tag}) was used in a new submission and has been flagged. An admin will review the two screenshots.`).catch(() => null);
+            await logToGuild(guild, 'Duplicate tag flagged', `User <@${message.author.id}> submitted tag ${parsed.player_tag} which conflicts with <@${conflictRecord.user_id}>.`);
+          } else {
+            if (OCR_DEBUG) console.warn('Admin user not found', ADMIN_USER_ID);
+            await message.author.send('Admin not reachable. Please contact a server admin directly.');
+            await logToGuild(guild, 'Duplicate tag - admin not found', `Admin ${ADMIN_USER_ID} not found for duplicate tag ${parsed.player_tag}`);
+          }
         } catch (e) {
-          if (OCR_DEBUG) console.warn('Failed to send DM to admin:', e?.message || e);
+          if (OCR_DEBUG) console.warn('Failed to send DM to admin fallback:', e?.message || e);
           await message.author.send('Could not contact the admin at this time. Please contact a server admin directly.');
           await logToGuild(guild, 'Duplicate tag - admin DM failed', `Could not send DM to admin for duplicate tag ${parsed.player_tag} by <@${message.author.id}>`);
         }
-      } else {
-        if (OCR_DEBUG) console.warn('Admin user not found', ADMIN_USER_ID);
-        await message.author.send('Admin not reachable. Please contact a server admin directly.');
-        await logToGuild(guild, 'Duplicate tag - admin not found', `Admin ${ADMIN_USER_ID} not found for duplicate tag ${parsed.player_tag}`);
       }
 
       return;
